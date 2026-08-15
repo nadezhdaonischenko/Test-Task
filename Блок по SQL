@@ -50,3 +50,221 @@ GROUP BY
        a.client_id
 HAVING 
        SUM(t.amount numeric)>5000
+
+
+-- Задача 1
+
+/* ============================================================================
+   ЗАДАЧА 1. Ранжирование ТОП-5 товаров в каждой категории по месяцам
+   ============================================================================
+   Логика решения: 
+   Для выделения лучших товаров используется двухэтапный подход через CTE. 
+   Сначала на шаге table_group данные агрегируются до уровня «месяц-категория-товар» 
+   для расчета чистой суммы выручки. Использование date_trunc() позволяет не терять года.
+   Затем на шаге table_rnk применяется оконная функция DENSE_RANK(), 
+   которая ранжирует товары по убыванию продаж отдельно внутри каждой категории каждого месяца. 
+   (Если топ-5 "жестко" ограничен 5-ю позициями, функцию следует поменять на row_number()).
+   Финальный фильтр отсекает топ-5 позиций. Для наглядности отчета дата разделена на два самостоятельных 
+   текстовых столбца («Год» и «Месяц»), а сортировка по исходному полю month_num 
+   гарантирует строго хронологический порядок вывода. 
+   Добавление года обусловлено необходимостью логического разделения годовых данных. 
+   Если потребуется детализация или агрегация данных до уровня месяца, скрипт необходимо скорректировать (2-ой вариант ниже).
+   ============================================================================ */
+
+with table_group as (
+	select date_trunc('month', dttm)::date as month_num,
+		   category,
+		   name,
+		   sum(summ) as amount
+	from test_sales_dataset 
+	group by date_trunc('month', dttm), category, name
+),
+
+table_rnk as (
+	select month_num,
+		   category,
+		   name,
+		   amount,
+		   dense_rank() over(partition by month_num, category order by amount desc) as rnk
+	from table_group
+)
+
+select to_char(month_num, 'YYYY') AS "Год",
+	   to_char(month_num, 'TMMonth') AS "Месяц",
+	   category as "Категория",
+	   name as "Товар",
+	   -- rnk as "ТОП-5", -- можно добавить при необходимости
+	   amount as "Объем продаж"
+from table_rnk
+where rnk between 1 and 5
+order by month_num, category, rnk;
+
+/*-- Задача 1 (вариант 2 - все данные сведены только по месяцам)
+
+with table_group as (
+	select extract(month from dttm) as month_num,
+		   category,
+		   name,
+		   sum(summ) as amount
+	from test_sales_dataset 
+	group by extract(month from dttm), category, name
+),
+
+table_rnk as (
+	select month_num,
+		   category,
+		   name,
+		   amount,
+		   dense_rank() over(partition by month_num, category order by amount desc) as rnk
+	from table_group
+)
+
+select CASE month_num
+			WHEN 1 THEN 'Январь'   
+        	WHEN 2 THEN 'Февраль' 
+        	WHEN 3 THEN 'Март'
+       		WHEN 4 THEN 'Апрель'   
+        	WHEN 5 THEN 'Май'     
+        	WHEN 6 THEN 'Июнь'
+        	WHEN 7 THEN 'Июль'     
+        	WHEN 8 THEN 'Август'  
+        	WHEN 9 THEN 'Сентябрь'
+        	WHEN 10 THEN 'Октябрь' 
+        	WHEN 11 THEN 'Ноябрь' 
+        	WHEN 12 THEN 'Декабрь'
+       END AS "Месяц", 
+	   category as "Категория",
+	   name as "Товар",
+	   -- rnk as "ТОП-5",
+	   amount as "Объем продаж"
+from table_rnk
+where rnk between 1 and 5
+order by month_num, category, rnk;
+*/
+
+-- Задача 2
+
+/* ============================================================================
+   ЗАДАЧА 2. Поиск регулярных продаж товара в течение недели
+   ============================================================================
+   Логика решения: 
+   Справочник товаров объединяется с таблицей заказов по идентификатору tov_id. 
+   Период ограничен в блоке WHERE жесткими рамками с 1 по 7 апреля 2024 года. 
+   Ключевая аналитическая логика заложена в блоке HAVING: условие 
+   COUNT(DISTINCT date_check) = 7 гарантирует, что в итоговый отчет попадут только 
+   те товары, у которых зафиксированы продажи в каждый из 7 дней этой недели без 
+   исключений. 
+   ============================================================================ */
+
+select name as "Товар", sum(quantity*price) as "Объем продаж"
+from test_tovari_dataset ttd 
+join test_orders_dataset tod on ttd.tov_id=tod.tov_id
+where date_check between '2024-04-01' and '2024-04-07'
+group by name
+having count(distinct date_check)=7;
+
+-- Задача 3
+
+/* ============================================================================
+   ЗАДАЧА 3. Нарастающий итог по продажам
+   ============================================================================
+   Логика решения: 
+   Базовое агрегирование и расчет аналитического окна разделены на два шага, 
+   чтобы избежать конфликта СУБД при одновременном схлопывании строк и вычислении окна. 
+   В подзапросе table_sum продажи суммируются по месяцам и категориям. В основном 
+   запросе рассчитывается нарастающее SUM(amount) OVER(...) с рамкой строк 
+   rows between unbounded preceding and current row. Конструкция 
+   PARTITION BY to_char(month_num, 'YYYY'), cat_name изолирует расчеты, благодаря 
+   чему накопление продаж идет независимо для каждой категории и автоматически 
+   обнуляется при переходе на следующий календарный год. 
+   Результат разделен на столбцы года и месяца для логического разделения годовых данных. 
+   Если потребуется детализация или агрегация данных до уровня месяца, скрипт необходимо скорректировать (2-ой вариант ниже).
+   ============================================================================ */
+
+with table_sum as (
+	select date_trunc('month', date_check)::date as month_num,
+	   	   cat_name,
+	   	   sum(quantity) as amount
+	from test_orders_dataset tod
+	join test_tovari_dataset ttd on ttd.tov_id=tod.tov_id 
+	join test_categories_dataset tcd on ttd.cat_id=tcd.cat_id
+	group by date_trunc('month', date_check)::date, cat_name
+)
+
+select to_char(month_num, 'YYYY') AS "Год",
+	   to_char(month_num, 'TMMonth') AS "Месяц",
+	   cat_name as "Категория",
+	   amount as "Кол-во проданного товара",
+	   sum(amount) over(
+                    partition by to_char(month_num, 'YYYY'), cat_name 
+                    order by month_num 
+                    rows between unbounded preceding and current row) as "Нарастающий итог"
+from table_sum
+order by month_num, cat_name;
+
+/*-- Задача 3 (вариант 2 - все данные сведены только по месяцам)
+with table_sum as (
+	select extract(month from date_check) as month_num,
+	   	   cat_name,
+	   	   sum(quantity) as amount
+	from test_orders_dataset tod
+	join test_tovari_dataset ttd on ttd.tov_id=tod.tov_id 
+	join test_categories_dataset tcd on ttd.cat_id=tcd.cat_id
+	group by extract(month from date_check), cat_name
+)
+
+select CASE month_num
+			WHEN 1 THEN 'Январь'   
+        	WHEN 2 THEN 'Февраль' 
+        	WHEN 3 THEN 'Март'
+       		WHEN 4 THEN 'Апрель'   
+        	WHEN 5 THEN 'Май'     
+        	WHEN 6 THEN 'Июнь'
+        	WHEN 7 THEN 'Июль'     
+        	WHEN 8 THEN 'Август'  
+        	WHEN 9 THEN 'Сентябрь'
+        	WHEN 10 THEN 'Октябрь' 
+        	WHEN 11 THEN 'Ноябрь' 
+        	WHEN 12 THEN 'Декабрь'
+       END AS "Месяц", 
+	   cat_name as "Категория",
+	   sum(amount) over(
+                    partition by cat_name 
+                    order by month_num 
+                    rows between unbounded preceding and current row) as "Нарастающий итог"
+from table_sum
+order by month_num, cat_name;
+*/
+
+-- Задача 4
+
+/* ============================================================================
+   ЗАДАЧА 4. Средний чек и маржинальность (Метрики за 2023 год)
+   ============================================================================
+   Логика решения: 
+   В данной задаче рассчитываются метрики в разрезе сегментов 
+   и каналов продаж за 2022 год. Чтобы оффлайн-заказы не пропали из отчета 
+   (для них поле cust_id в заказах пустое), используется LEFT JOIN к таблице клиентов. 
+   Функция COALESCE перехватывает значения NULL и подставляет вместо них статус 
+   «новый участник». Логика разделения на online / offline реализована через 
+   проверку наличия интернет-номера заказа (CASE WHEN ord_id IS NULL). При расчете 
+   среднего чека применена формула SUM(выручки) / COUNT(DISTINCT check_id), 
+   что позволяет узнать среднюю стоимость всей корзины. 
+   Маржинальность рассчитана как разница между выручкой и себестоимостью продаж.
+   В блоке GROUP BY использованы порядковые номера столбцов из SELECT, 
+   чтобы избежать дублирования громоздких выражений.
+   ============================================================================ */
+
+select coalesce(segment, 'новый участник') as "Сегмент",
+	   case 
+	   	when ord_id is null then 'offline'
+	   	else 'online'
+	   end as "Тип заказа",
+	   round(sum(quantity*price)/count(distinct check_id), 2) as "Средний чек",
+	   round(sum(quantity*price) - sum(quantity*sebest), 2) as "Валовая маржа"
+from test_orders_dataset tod
+join test_tovari_dataset ttd on ttd.tov_id=tod.tov_id 
+left join test_customers_dataset tcd on tcd.cust_id=tod.cust_id
+where extract(year from date_check::date) = 2022
+group by 1, 2
+order by "Валовая маржа" desc;
